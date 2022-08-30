@@ -6,23 +6,8 @@ fn win32_err_string(err: HRESULT) -> String {
 }
 
 pub mod memory {
-
-    pub struct ForeignMemoryShadow(&'static mut [u8]);
-
-    impl ForeignMemoryShadow {
-        pub fn n_bytes(&self) -> usize {
-            self.0.len()
-        }
-        pub fn saddr(&self) -> *const u8 {
-            self.0.as_ptr()
-        }
-        unsafe fn saddr_mut(&mut self) -> *mut u8 {
-            self.0.as_mut_ptr()
-        }
-    }
-
+    use super::{process::get_last_error, win32_err_string};
     use std::{error::Error, ffi::c_void, mem::size_of, ptr::null, slice::from_raw_parts_mut};
-
     use windows::Win32::{
         Foundation::HANDLE,
         System::{
@@ -34,7 +19,24 @@ pub mod memory {
         },
     };
 
-    use super::{process::get_last_error, win32_err_string};
+    pub struct ForeignMemoryShadow(&'static mut [u8]);
+
+    impl ForeignMemoryShadow {
+        #[inline]
+        pub fn n_bytes(&self) -> usize {
+            self.0.len()
+        }
+
+        #[inline]
+        pub fn saddr(&self) -> *const u8 {
+            self.0.as_ptr()
+        }
+
+        #[inline]
+        unsafe fn saddr_mut(&mut self) -> *mut u8 {
+            self.0.as_mut_ptr()
+        }
+    }
 
     #[inline]
     pub fn read_process_memory<T>(
@@ -99,6 +101,7 @@ pub mod memory {
             }
         }
     }
+
     #[inline]
     pub fn virtual_protect_ex(
         hprocess: HANDLE,
@@ -122,6 +125,7 @@ pub mod memory {
         }
     }
 
+    #[inline]
     pub fn virtual_alloc_ex<const T: usize>(
         hprocess: HANDLE,
         lpaddress: Option<usize>,
@@ -146,6 +150,7 @@ pub mod memory {
         }
     }
 
+    #[inline]
     pub fn virtual_free_ex(
         hprocess: HANDLE,
         mut alloc: ForeignMemoryShadow,
@@ -171,8 +176,8 @@ pub mod memory {
     }
 }
 pub mod process {
+    use super::win32_err_string;
     use std::error::Error;
-
     use windows::Win32::{
         Foundation::{CloseHandle, GetLastError, HANDLE, WIN32_ERROR},
         System::{
@@ -183,8 +188,6 @@ pub mod process {
             Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS},
         },
     };
-
-    use super::win32_err_string;
 
     #[inline]
     pub fn create_tool_help_32_snapshot(
@@ -309,14 +312,14 @@ mod tests {
     use super::{memory::virtual_alloc_ex, process::open_process, wrapper::get_pid_by_name};
 
     #[test]
-    pub fn test_get_pid_by_name() {
+    fn test_get_pid_by_name() {
         let name = "ac_client.exe";
         let res = get_pid_by_name(name);
         assert!(res.is_ok())
     }
 
     #[test]
-    pub fn test_open_process() {
+    fn test_open_process() {
         let name = "ac_client.exe";
         let pid = get_pid_by_name(name).unwrap();
         let res = open_process(PROCESS_ALL_ACCESS, false, pid);
@@ -325,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    pub fn test_read_write() {
+    fn test_read_write() {
         let name = "ac_client.exe";
         let pid = get_pid_by_name(name).unwrap();
         let hprocess = open_process(
@@ -354,5 +357,10 @@ mod tests {
         let res = virtual_free_ex(hprocess, target_mem, MEM_RELEASE, false);
         assert!(res.is_ok());
         close_handle(hprocess);
+    }
+
+    #[test]
+    fn test_protected_write() {
+        // change READ_WRITE to READ_ONLY and try to write
     }
 }
