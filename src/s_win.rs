@@ -105,15 +105,21 @@ pub mod memory {
     #[inline]
     pub fn virtual_protect_ex(
         hprocess: HANDLE,
-        lpaddress: usize,
-        dwsize: usize,
+        alloc: &ForeignMemoryShadow,
         flnewprotect: PAGE_PROTECTION_FLAGS,
         lpfloldprotect: &mut PAGE_PROTECTION_FLAGS,
     ) -> Result<(), Box<dyn Error>> {
-        let lpaddress = (lpaddress as *const usize).cast::<c_void>();
+        let lpaddress = (alloc.saddr() as *const usize).cast::<c_void>();
 
         let res = unsafe {
-            VirtualProtectEx(hprocess, lpaddress, dwsize, flnewprotect, lpfloldprotect).as_bool()
+            VirtualProtectEx(
+                hprocess,
+                lpaddress,
+                alloc.n_bytes(),
+                flnewprotect,
+                lpfloldprotect,
+            )
+            .as_bool()
         };
 
         match res {
@@ -300,12 +306,12 @@ mod tests {
     use std::mem::size_of;
 
     use windows::Win32::System::{
-        Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE},
+        Memory::{MEM_COMMIT, MEM_RELEASE, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE},
         Threading::{PROCESS_ALL_ACCESS, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE},
     };
 
     use crate::s_win::{
-        memory::{read_process_memory, virtual_free_ex, write_process_memory},
+        memory::{read_process_memory, virtual_free_ex, virtual_protect_ex, write_process_memory},
         process::close_handle,
     };
 
@@ -362,5 +368,39 @@ mod tests {
     #[test]
     fn test_protected_write() {
         // change READ_WRITE to READ_ONLY and try to write
+        let name = "ac_client.exe";
+        let pid = get_pid_by_name(name).unwrap();
+        let hprocess = open_process(
+            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+            false,
+            pid,
+        )
+        .unwrap();
+
+        let mut nbytes = Default::default();
+        const LEN: usize = 4 * size_of::<u8>();
+        let mem = virtual_alloc_ex::<LEN>(hprocess, None, MEM_COMMIT, PAGE_READWRITE).unwrap();
+        write_process_memory(
+            hprocess,
+            &[u8::MAX, u8::MAX, u8::MAX, u8::MAX],
+            &mem,
+            &mut nbytes,
+        )
+        .unwrap();
+
+        let mut prot: PAGE_PROTECTION_FLAGS = Default::default();
+        let res = virtual_protect_ex(hprocess, &mem, PAGE_READONLY, &mut prot);
+        assert!(res.is_ok());
+
+        let res = write_process_memory(
+            hprocess,
+            &[u8::MIN, u8::MIN, u8::MIN, u8::MIN],
+            &mem,
+            &mut nbytes,
+        );
+        assert!(res.is_err());
+
+        virtual_free_ex(hprocess, mem, MEM_RELEASE, false).unwrap();
+        close_handle(hprocess);
     }
 }
