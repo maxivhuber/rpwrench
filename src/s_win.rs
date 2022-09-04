@@ -7,7 +7,13 @@ fn win32_err_string(err: HRESULT) -> String {
 
 pub mod memory {
     use super::{process::get_last_error, win32_err_string};
-    use std::{error::Error, ffi::c_void, mem::size_of, ptr::null, slice::from_raw_parts_mut};
+    use std::{
+        error::Error,
+        ffi::c_void,
+        mem::size_of,
+        ptr::{self, null},
+        slice::from_raw_parts_mut,
+    };
     use windows::Win32::{
         Foundation::HANDLE,
         System::{
@@ -28,12 +34,12 @@ pub mod memory {
         }
 
         #[inline]
-        pub fn saddr(&self) -> *const u8 {
+        pub fn start_addr(&self) -> *const u8 {
             self.0.as_ptr()
         }
 
         #[inline]
-        unsafe fn saddr_mut(&mut self) -> *mut u8 {
+        unsafe fn start_addr_mut(&mut self) -> *mut u8 {
             self.0.as_mut_ptr()
         }
     }
@@ -43,12 +49,13 @@ pub mod memory {
         hprocess: HANDLE,
         lpbuffer: &mut [T],
         alloc: &ForeignMemoryShadow,
-        lpnumberofbytesread: &mut usize,
+        lpnumberofbytesread: Option<*mut usize>,
     ) -> Result<(), Box<dyn Error>> {
         assert_eq!(lpbuffer.len() * size_of::<T>(), alloc.n_bytes());
 
-        let lpbaseaddress = (alloc.saddr() as *const usize).cast::<c_void>();
+        let lpbaseaddress = (alloc.start_addr() as *const usize).cast::<c_void>();
         let lpbuffer = lpbuffer.as_mut_ptr().cast::<c_void>();
+        let lpnumberofbytesread = lpnumberofbytesread.unwrap_or(ptr::null_mut());
 
         let res = unsafe {
             ReadProcessMemory(
@@ -75,12 +82,13 @@ pub mod memory {
         hprocess: HANDLE,
         lpbuffer: &[T],
         alloc: &ForeignMemoryShadow,
-        lpnumberofbyteswritten: &mut usize,
+        lpnumberofbyteswritten: Option<*mut usize>,
     ) -> Result<(), Box<dyn Error>> {
         assert_eq!(alloc.n_bytes(), lpbuffer.len() * size_of::<T>());
 
-        let lpbaseaddress = (alloc.saddr() as *const usize).cast::<c_void>();
+        let lpbaseaddress = (alloc.start_addr() as *const usize).cast::<c_void>();
         let lpbuffer = lpbuffer.as_ptr().cast::<c_void>();
+        let lpnumberofbyteswritten = lpnumberofbyteswritten.unwrap_or(ptr::null_mut());
 
         let res = unsafe {
             WriteProcessMemory(
@@ -109,7 +117,7 @@ pub mod memory {
         flnewprotect: PAGE_PROTECTION_FLAGS,
         lpfloldprotect: &mut PAGE_PROTECTION_FLAGS,
     ) -> Result<(), Box<dyn Error>> {
-        let lpaddress = (alloc.saddr() as *const usize).cast::<c_void>();
+        let lpaddress = (alloc.start_addr() as *const usize).cast::<c_void>();
 
         let res = unsafe {
             VirtualProtectEx(
@@ -132,19 +140,22 @@ pub mod memory {
     }
 
     #[inline]
-    pub fn virtual_alloc_ex<const T: usize>(
+    pub fn virtual_alloc_ex(
         hprocess: HANDLE,
         lpaddress: Option<usize>,
+        dwsize: usize,
         flallocationtype: VIRTUAL_ALLOCATION_TYPE,
         flprotect: PAGE_PROTECTION_FLAGS,
     ) -> Result<ForeignMemoryShadow, Box<dyn Error>> {
         let res: *mut c_void;
         if let Some(lpaddress) = lpaddress {
             let lpaddress = (lpaddress as *const usize).cast::<c_void>();
-            res = unsafe { VirtualAllocEx(hprocess, lpaddress, T, flallocationtype, flprotect) };
+            res =
+                unsafe { VirtualAllocEx(hprocess, lpaddress, dwsize, flallocationtype, flprotect) };
         } else {
             let lpaddress = null::<usize>().cast::<c_void>();
-            res = unsafe { VirtualAllocEx(hprocess, lpaddress, T, flallocationtype, flprotect) };
+            res =
+                unsafe { VirtualAllocEx(hprocess, lpaddress, dwsize, flallocationtype, flprotect) };
         }
 
         match res.is_null() {
@@ -152,7 +163,9 @@ pub mod memory {
                 let err = get_last_error();
                 Err(win32_err_string(err.to_hresult()).into())
             }
-            false => Ok(unsafe { ForeignMemoryShadow(from_raw_parts_mut(res.cast::<u8>(), T)) }),
+            false => {
+                Ok(unsafe { ForeignMemoryShadow(from_raw_parts_mut(res.cast::<u8>(), dwsize)) })
+            }
         }
     }
 
@@ -163,7 +176,7 @@ pub mod memory {
         dwfreetype: VIRTUAL_FREE_TYPE,
         decommit_region: bool,
     ) -> Result<(), Box<dyn Error>> {
-        let lpaddress = unsafe { alloc.saddr_mut().cast::<c_void>() };
+        let lpaddress = unsafe { alloc.start_addr_mut().cast::<c_void>() };
         let mut dwsize = alloc.n_bytes();
 
         if (dwfreetype == MEM_RELEASE) || (dwfreetype == MEM_DECOMMIT && decommit_region) {
@@ -183,7 +196,13 @@ pub mod memory {
 }
 pub mod process {
     use super::win32_err_string;
-    use std::error::Error;
+    use std::{
+        error::Error,
+        ffi::c_void,
+        mem,
+        ptr::{self},
+        time::Duration,
+    };
     use windows::Win32::{
         Foundation::{CloseHandle, GetLastError, HANDLE, WIN32_ERROR},
         System::{
@@ -191,7 +210,10 @@ pub mod process {
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
                 CREATE_TOOLHELP_SNAPSHOT_FLAGS, PROCESSENTRY32W,
             },
-            Threading::{OpenProcess, PROCESS_ACCESS_RIGHTS},
+            Threading::{
+                CreateRemoteThread, OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS,
+            },
+            WindowsProgramming::INFINITE,
         },
     };
 
@@ -262,6 +284,53 @@ pub mod process {
     #[inline]
     pub fn close_handle(hobject: HANDLE) -> bool {
         unsafe { CloseHandle(hobject).as_bool() }
+    }
+
+    #[inline]
+    pub fn create_remote_thread<T>(
+        hprocess: HANDLE,
+        dwstacksize: Option<usize>,
+        lpstartaddress: usize,
+        lpparameter: &T,
+        dwcreationflags: u32,
+        lpthreadid: Option<*mut u32>,
+    ) -> Result<HANDLE, Box<dyn Error>> {
+        let dwstacksize = dwstacksize.unwrap_or(0);
+        let lpthreadid = lpthreadid.unwrap_or(ptr::null_mut());
+        let lpparameter = (lpparameter as *const T).cast::<c_void>();
+
+        let res = unsafe {
+            CreateRemoteThread(
+                hprocess,
+                ptr::null(),
+                dwstacksize,
+                mem::transmute(lpstartaddress),
+                lpparameter,
+                dwcreationflags,
+                lpthreadid,
+            )
+        };
+
+        match res {
+            Ok(res) => Ok(res),
+            Err(err) => Err(win32_err_string(err.code()).into()),
+        }
+    }
+
+    pub enum WfsoP2 {
+        Zero,
+        Infinite,
+        Period(Duration),
+    }
+
+    #[inline]
+    pub fn wait_for_single_object(hhandle: HANDLE, dwmilliseconds: WfsoP2) -> u32 {
+        let dwmilliseconds = match dwmilliseconds {
+            WfsoP2::Zero => 0,
+            WfsoP2::Infinite => INFINITE,
+            WfsoP2::Period(p) => p.as_millis() as u32,
+        };
+        unsafe { WaitForSingleObject(hhandle, dwmilliseconds) }
     }
 }
 pub mod wrapper {
@@ -345,18 +414,17 @@ mod tests {
         .unwrap();
 
         const LEN: usize = 4 * size_of::<u8>();
-        let mem = virtual_alloc_ex::<LEN>(hprocess, None, MEM_COMMIT, PAGE_READWRITE);
+        let mem = virtual_alloc_ex(hprocess, None, LEN, MEM_COMMIT, PAGE_READWRITE);
         assert!(mem.is_ok());
 
         let target_mem = mem.unwrap();
         let mut lpbuffer: [u8; LEN] = [u8::MAX, u8::MAX, u8::MAX, u8::MAX];
-        let mut nbytes = Default::default();
 
-        let res = write_process_memory(hprocess, &lpbuffer[..], &target_mem, &mut nbytes);
+        let res = write_process_memory(hprocess, &lpbuffer[..], &target_mem, None);
         assert!(res.is_ok());
 
         lpbuffer = [u8::MIN, u8::MIN, u8::MIN, u8::MIN];
-        let res = read_process_memory(hprocess, &mut lpbuffer, &target_mem, &mut nbytes);
+        let res = read_process_memory(hprocess, &mut lpbuffer, &target_mem, None);
         assert!(res.is_ok());
         assert_eq!(lpbuffer, [u8::MAX, u8::MAX, u8::MAX, u8::MAX]);
 
@@ -377,27 +445,15 @@ mod tests {
         )
         .unwrap();
 
-        let mut nbytes = Default::default();
         const LEN: usize = 4 * size_of::<u8>();
-        let mem = virtual_alloc_ex::<LEN>(hprocess, None, MEM_COMMIT, PAGE_READWRITE).unwrap();
-        write_process_memory(
-            hprocess,
-            &[u8::MAX, u8::MAX, u8::MAX, u8::MAX],
-            &mem,
-            &mut nbytes,
-        )
-        .unwrap();
+        let mem = virtual_alloc_ex(hprocess, None, LEN, MEM_COMMIT, PAGE_READWRITE).unwrap();
+        write_process_memory(hprocess, &[u8::MAX, u8::MAX, u8::MAX, u8::MAX], &mem, None).unwrap();
 
         let mut prot: PAGE_PROTECTION_FLAGS = Default::default();
         let res = virtual_protect_ex(hprocess, &mem, PAGE_READONLY, &mut prot);
         assert!(res.is_ok());
 
-        let res = write_process_memory(
-            hprocess,
-            &[u8::MIN, u8::MIN, u8::MIN, u8::MIN],
-            &mem,
-            &mut nbytes,
-        );
+        let res = write_process_memory(hprocess, &[u8::MIN, u8::MIN, u8::MIN, u8::MIN], &mem, None);
         assert!(res.is_err());
 
         virtual_free_ex(hprocess, mem, MEM_RELEASE, false).unwrap();
